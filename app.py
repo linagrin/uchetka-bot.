@@ -463,7 +463,7 @@ async def cmd_allweeks(m: Message):
 async def cmd_myid(m: Message):
     await m.answer(f"Твой Telegram ID: {m.from_user.id}\nUsername: @{m.from_user.username or '—'}")
 
-@dp.message(Command("broadcast")))
+@dp.message(Command("broadcast"))
 async def cmd_broadcast(m: Message):
     if not is_admin(m.from_user.id, m.from_user.username):
         return
