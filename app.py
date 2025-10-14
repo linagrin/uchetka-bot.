@@ -1,13 +1,13 @@
 # УЧЕТКА — Telegram-бот учёта рабочего времени
-# Режим: 10:00–19:00, перерывы не вычитаются. Пн–Пт.
+# Режим: 10:00–19:00 (Пн–Пт), перерывы не вычитаются.
 # Храним только текущий месяц; 1-го числа — саммари и чистка прошлого.
 # Пятница до 19:00: предупреждение при жёстком недоборе.
-# Форматы ввода времени: "10:30", "14.10.2025 10:30", "14.10 10:30".
-# НОВОЕ:
-# - /allweeks — баланс по ВСЕМ неделям текущего месяца + итог;
-# - /week удалён;
-# - /in, /out, /retro — разрешены ТОЛЬКО в рамках текущего месяца;
-# - повторный /in или /out для той же даты ПЕРЕЗАПИСЫВАЕТ предыдущее значение за этот день.
+# Форматы ввода: "10:30", "14.10.2025 10:30", "14.10 10:30".
+# Новое:
+# - /allweeks — баланс по неделям месяца + итог;
+# - /week и /retro убраны;
+# - /in, /out — только в рамках текущего месяца; повторная отметка за день перезаписывает предыдущую;
+# - /broadcast — рассылка всем пользователям (только для админов по username/ID).
 
 import os
 import asyncio
@@ -16,7 +16,7 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import asyncpg
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiohttp import web
@@ -31,6 +31,21 @@ HARD_DEFICIT_MIN = 60
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
+
+# --- Админы: username и/или ID ---
+ADMIN_USERNAMES = {
+    x.lstrip("@").lower()
+    for x in os.getenv("ADMIN_USERNAMES", "linagrin").replace(" ", "").split(",")
+    if x
+}
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+
+def is_admin(user_id: int, username: str | None) -> bool:
+    if user_id in ADMIN_IDS:
+        return True
+    if username and username.lower() in ADMIN_USERNAMES:
+        return True
+    return False
 
 DB_POOL: asyncpg.Pool | None = None
 
@@ -72,7 +87,6 @@ def month_start(dt: datetime) -> datetime:
 
 def next_month_start(dt: datetime) -> datetime:
     first = month_start(dt)
-    # прибавим 32 дня и вернёмся к 1-му
     tmp = first + timedelta(days=32)
     return tmp.replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ)
 
@@ -85,7 +99,7 @@ def prev_month_bounds(dt: datetime) -> tuple[datetime, datetime]:
 def is_in_current_month(when: datetime, now: datetime) -> bool:
     return month_start(now) <= when < next_month_start(now)
 
-# Парсер времени: "10:30"; "DD.MM.YYYY HH:MM"; "DD.MM HH:MM"
+# Парсер времени: "10:30"; "DD.MM.YYYY HH:MM"; "DD.MM HH:MM"; ISO fallback
 def parse_when(arg: str | None, now: datetime) -> datetime:
     if not arg or not arg.strip():
         return now
@@ -102,8 +116,7 @@ def parse_when(arg: str | None, now: datetime) -> datetime:
     if m:
         dd, mo, hh, mm = map(int, m.groups())
         return datetime(now.year, mo, dd, hh, mm, tzinfo=TZ)
-    # поддержим ISO если вдруг пришлют
-    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})\s+([01]\d|2[0-3]):([0-5]\d)", s)
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})\s+([01]\d|2[0-3]):([0-5]\d)", s)  # ISO fallback
     if m:
         y, mo, dd, hh, mm = map(int, m.groups())
         return datetime(y, mo, dd, hh, mm, tzinfo=TZ)
@@ -117,11 +130,10 @@ async def purge_before_current_month(conn: asyncpg.Connection, now: datetime):
     m0 = month_start(now)
     await conn.execute("DELETE FROM sessions WHERE start_ts < $1", m0)
 
-# Последний /in за день — главный: перезаписываем старт
+# Последний /in за день — главный
 async def upsert_in_for_day(conn: asyncpg.Connection, uid: int, when: datetime) -> str:
     day0 = datetime(when.year, when.month, when.day, 0, 0, tzinfo=TZ)
     day1 = day0 + timedelta(days=1)
-    # ищем любые сессии этого дня
     row_open = await conn.fetchrow("""
         SELECT id FROM sessions
         WHERE user_id=$1 AND end_ts IS NULL AND start_ts >= $2 AND start_ts < $3
@@ -138,15 +150,13 @@ async def upsert_in_for_day(conn: asyncpg.Connection, uid: int, when: datetime) 
     if row_any:
         await conn.execute("UPDATE sessions SET start_ts=$1 WHERE id=$2", when, row_any["id"])
         return f"Приход обновлён: {when.strftime('%d.%m.%Y %H:%M')}"
-    # иначе создаём новую сессию этого дня
     await conn.execute("INSERT INTO sessions(user_id, start_ts) VALUES($1,$2)", uid, when)
     return f"Старт {when.strftime('%d.%m.%Y %H:%M')}"
 
-# Последний /out за день — главный: перезаписываем финиш
+# Последний /out за день — главный
 async def set_out_for_day(conn: asyncpg.Connection, uid: int, when: datetime) -> str:
     day0 = datetime(when.year, when.month, when.day, 0, 0, tzinfo=TZ)
     day1 = day0 + timedelta(days=1)
-    # сначала пробуем закрыть открытую сессию этого дня
     row_open = await conn.fetchrow("""
         SELECT id, start_ts FROM sessions
         WHERE user_id=$1 AND end_ts IS NULL AND start_ts >= $2 AND start_ts < $3
@@ -158,7 +168,6 @@ async def set_out_for_day(conn: asyncpg.Connection, uid: int, when: datetime) ->
             return "Время ухода раньше времени прихода. Укажи корректное время."
         await conn.execute("UPDATE sessions SET end_ts=$1 WHERE id=$2", when, row_open["id"])
         return f"Финиш {when.strftime('%d.%m.%Y %H:%M')} (начал(а) {start_ts.strftime('%d.%m.%Y %H:%M')})"
-    # если открытой нет — ищем любую сессию этого дня и обновляем её финиш
     row_any = await conn.fetchrow("""
         SELECT id, start_ts, end_ts FROM sessions
         WHERE user_id=$1 AND start_ts >= $2 AND start_ts < $3
@@ -171,15 +180,6 @@ async def set_out_for_day(conn: asyncpg.Connection, uid: int, when: datetime) ->
         await conn.execute("UPDATE sessions SET end_ts=$1 WHERE id=$2", when, row_any["id"])
         return f"Финиш обновлён: {when.strftime('%d.%m.%Y %H:%M')} (начал(а) {start_ts.strftime('%d.%m.%Y %H:%M')})"
     return "Нет сессии для этого дня. Сначала /in для этой даты."
-
-async def undo_last(conn: asyncpg.Connection, uid: int) -> str:
-    row = await conn.fetchrow("SELECT id, start_ts, end_ts FROM sessions WHERE user_id=$1 ORDER BY id DESC LIMIT 1", uid)
-    if not row:
-        return "Нечего отменять."
-    await conn.execute("DELETE FROM sessions WHERE id=$1", row["id"])
-    s = dlocal(row["start_ts"]).strftime("%d.%m.%Y %H:%M")
-    e = dlocal(row["end_ts"]).strftime("%d.%m.%Y %H:%M") if row["end_ts"] else "…"
-    return f"Последняя сессия удалена: {s}–{e}"
 
 # ---------- Расчёты ----------
 def _deviation_minutes(first_in: datetime|None, last_out: datetime|None, day: datetime) -> int:
@@ -280,7 +280,7 @@ async def month_summary_text(conn: asyncpg.Connection, uid: int, first_prev: dat
             f"Постарайся не допускать такого в следующем месяце"
         )
 
-# ---------- Ежемесячный планировщик ----------
+# ---------- Планировщик саммари ----------
 async def send_month_summaries(bot: Bot, pool: asyncpg.Pool):
     while True:
         try:
@@ -324,7 +324,7 @@ async def run_health_server():
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Короткий /start — без простыней
+# Короткий /start
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     now = local_now()
@@ -339,12 +339,12 @@ async def cmd_help(m: Message):
         "Подсказки:\n"
         "• /in — приход (можно: «/in 10:30» или «/in 14.10.2025 10:30»)\n"
         "• /out — уход (можно с временем, как выше)\n"
-        "• /retro 14.10.2025 09:50 in|out — задним числом (только текущий месяц)\n"
         "• /undo — отмена последней отметки\n"
         "• /status — баланс текущей недели\n"
         "• /day — отчёт за сегодня (можно дату: «/day 14.10.2025»)\n"
         "• /allweeks — балансы по всем неделям текущего месяца + итог\n"
-        "\nПравила: 10:00–19:00, обед не вычитается. Данные — только текущий месяц."
+        "\nПравила: 10:00–19:00, обед не вычитается. Данные — только текущий месяц.\n"
+        "Повторная отметка за день заменяет предыдущую."
     )
 
 # --- Команды фиксации ---
@@ -384,34 +384,6 @@ async def cmd_out(m: Message):
     sign = "+" if bal >= 0 else ""
     note = deficit_alert(when, bal)
     await m.answer(f"{txt}\nБаланс недели: {sign}{bal} мин." + (f"\n{note}" if note else ""))
-
-@dp.message(Command("retro"))
-async def cmd_retro(m: Message):
-    # /retro 14.10.2025 09:50 in|out — ТОЛЬКО текущий месяц
-    parts = (m.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await m.answer("Формат: /retro 14.10.2025 09:50 in|out"); return
-    try:
-        dt_part, kind = parts[1].rsplit(" ", 1)
-        when = parse_when(dt_part, local_now())
-        kind = kind.lower()
-        if kind not in {"in", "out"}:
-            raise ValueError
-    except Exception:
-        await m.answer("Формат: /retro 14.10.2025 09:50 in|out"); return
-    now = local_now()
-    if not is_in_current_month(when, now):
-        await m.answer("Отметки можно вносить только в рамках текущего месяца."); return
-    async with DB_POOL.acquire() as conn:
-        await ensure_user(conn, m.from_user.id)
-        await purge_before_current_month(conn, now)
-        if kind == "in":
-            txt = await upsert_in_for_day(conn, m.from_user.id, when)
-        else:
-            txt = await set_out_for_day(conn, m.from_user.id, when)
-        bal = await week_deviation(conn, m.from_user.id, when)
-    sign = "+" if bal >= 0 else ""
-    await m.answer(f"{txt}\nБаланс недели: {sign}{bal} мин.")
 
 @dp.message(Command("undo"))
 async def cmd_undo(m: Message):
@@ -463,7 +435,6 @@ async def cmd_allweeks(m: Message):
     now = local_now()
     m0 = month_start(now)
     m1 = next_month_start(now)
-    # собираем по неделям (ключ — понедельник недели)
     buckets = {}
     async with DB_POOL.acquire() as conn:
         d = m0
@@ -474,11 +445,8 @@ async def cmd_allweeks(m: Message):
                 buckets[mon] = buckets.get(mon, 0) + dev
             d += timedelta(days=1)
     if not buckets:
-        await m.answer(f"{m0.strftime('%B %Y').capitalize()}: пока нет данных.")
-        return
-    # отсортируем по неделям и пронумеруем в пределах месяца
+        await m.answer(f"{m0.strftime('%B %Y').capitalize()}: пока нет данных."); return
     weeks = sorted(buckets.items(), key=lambda kv: kv[0])
-    # фильтруем только недели, которые пересекают текущий месяц
     weeks = [kv for kv in weeks if kv[0] < m1 and kv[0] + timedelta(days=6) >= m0]
     total = sum(v for _, v in weeks)
     lines = []
@@ -489,6 +457,33 @@ async def cmd_allweeks(m: Message):
     month_title = m0.strftime('%B %Y').capitalize()
     text = f"{month_title}\n" + "\n".join(lines) + f"\nИтого: {sign_total}{total} мин"
     await m.answer(text)
+
+# --- Админские команды ---
+@dp.message(Command("myid"))
+async def cmd_myid(m: Message):
+    await m.answer(f"Твой Telegram ID: {m.from_user.id}\nUsername: @{m.from_user.username or '—'}")
+
+@dp.message(Command("broadcast")))
+async def cmd_broadcast(m: Message):
+    if not is_admin(m.from_user.id, m.from_user.username):
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await m.answer("Напиши текст после команды. Пример:\n/broadcast Завтра работаем до 20:00")
+        return
+    text = parts[1].strip()
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM users")
+    user_ids = [r["user_id"] for r in rows]
+    sent = failed = 0
+    for uid in user_ids:
+        try:
+            await m.bot.send_message(chat_id=uid, text=text)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # ~20 msg/s
+    await m.answer(f"Рассылка завершена. Успешно: {sent}, ошибок: {failed}.")
 
 # ---------- Точка входа ----------
 async def main():
