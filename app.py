@@ -1,13 +1,14 @@
 # УЧЕТКА — Telegram-бот учёта рабочего времени
 # Режим: 10:00–19:00 (Пн–Пт), перерывы не вычитаются.
-# Храним только текущий месяц; 1-го числа — саммари и чистка прошлого.
+# Данные — только текущий месяц; 1-го числа — саммари прошлого.
 # Пятница до 19:00: предупреждение при жёстком недоборе.
 # Форматы ввода: "10:30", "14.10.2025 10:30", "14.10 10:30".
 # Новое:
 # - /allweeks — баланс по неделям месяца + итог;
 # - /week и /retro убраны;
-# - /in, /out — только в рамках текущего месяца; повторная отметка за день перезаписывает предыдущую;
-# - /broadcast — рассылка всем пользователям (только для админов по username/ID).
+# - /in, /out — только в пределах текущего месяца; последняя отметка за день заменяет предыдущую;
+# - календарь исключений (праздники/рабочие переносы) + админ-команды;
+# - /broadcast — рассылка всем пользователям (только для админов).
 
 import os
 import asyncio
@@ -16,7 +17,7 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import asyncpg
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiohttp import web
@@ -25,7 +26,7 @@ from aiohttp import web
 TZ = ZoneInfo("Europe/Amsterdam")
 START_T = time(10, 0)
 END_T   = time(19, 0)
-WORKDAYS = {0, 1, 2, 3, 4}
+WORKDAYS = {0, 1, 2, 3, 4}  # базово Пн–Пт
 DAILY_NORM_MIN = 9 * 60
 HARD_DEFICIT_MIN = 60
 
@@ -69,6 +70,13 @@ CREATE TABLE IF NOT EXISTS month_summaries(
   month   INT NOT NULL,
   sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY(user_id, year, month)
+);
+
+-- Исключения календаря:
+-- holiday = выходной (даже если будний), workday = рабочий (даже если Сб/Вс)
+CREATE TABLE IF NOT EXISTS calendar(
+  d DATE PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('holiday','workday'))
 );
 """
 
@@ -129,6 +137,13 @@ async def ensure_user(conn: asyncpg.Connection, uid: int):
 async def purge_before_current_month(conn: asyncpg.Connection, now: datetime):
     m0 = month_start(now)
     await conn.execute("DELETE FROM sessions WHERE start_ts < $1", m0)
+
+# Календарь: рабочий/выходной с учётом исключений
+async def is_workday(conn: asyncpg.Connection, d: datetime) -> bool:
+    row = await conn.fetchrow("SELECT kind FROM calendar WHERE d=$1", d.date())
+    if row:
+        return row["kind"] == "workday"
+    return d.weekday() in WORKDAYS
 
 # Последний /in за день — главный
 async def upsert_in_for_day(conn: asyncpg.Connection, uid: int, when: datetime) -> str:
@@ -237,7 +252,7 @@ async def week_deviation(conn: asyncpg.Connection, uid: int, any_dt: datetime) -
     total = 0
     for i in range(7):
         d = mon + timedelta(days=i)
-        if d.weekday() not in WORKDAYS:
+        if not await is_workday(conn, d):
             continue
         dev, _ = await day_deviation(conn, uid, d)
         total += dev
@@ -260,13 +275,21 @@ async def month_summary_text(conn: asyncpg.Connection, uid: int, first_prev: dat
         d += timedelta(days=1)
     if days_worked == 0 and minutes_worked == 0:
         return None
-    expected_workdays = sum(1 for i in range((first_this - first_prev).days) if (first_prev + timedelta(days=i)).weekday() in WORKDAYS)
+
+    expected_workdays = 0
+    cursor = first_prev
+    while cursor < first_this:
+        if await is_workday(conn, cursor):
+            expected_workdays += 1
+        cursor += timedelta(days=1)
+
     expected_minutes = expected_workdays * DAILY_NORM_MIN
     fact_hours = minutes_worked // 60
     fact_days = days_worked
     diff_min = minutes_worked - expected_minutes
     diff_hours_abs = abs(diff_min) // 60
     days_diff = abs(expected_workdays - fact_days)
+
     if diff_min >= 0:
         return (
             f"Ты отработал в этом месяце {fact_days} дней {fact_hours} часов\n"
@@ -343,8 +366,9 @@ async def cmd_help(m: Message):
         "• /status — баланс текущей недели\n"
         "• /day — отчёт за сегодня (можно дату: «/day 14.10.2025»)\n"
         "• /allweeks — балансы по всем неделям текущего месяца + итог\n"
-        "\nПравила: 10:00–19:00, обед не вычитается. Данные — только текущий месяц.\n"
-        "Повторная отметка за день заменяет предыдущую."
+        "\nПравила: 10:00–19:00, без вычета обеда. Данные — только текущий месяц.\n"
+        "Повторная отметка за день заменяет предыдущую.\n"
+        "Праздники и переносы учитываются (админ: /calendar, /addholiday ДД.ММ.ГГГГ, /addworkday ДД.ММ.ГГГГ)."
     )
 
 # --- Команды фиксации ---
@@ -439,7 +463,7 @@ async def cmd_allweeks(m: Message):
     async with DB_POOL.acquire() as conn:
         d = m0
         while d < m1:
-            if d.weekday() in WORKDAYS:
+            if await is_workday(conn, d):
                 dev, _ = await day_deviation(conn, m.from_user.id, d)
                 mon = week_monday(d)
                 buckets[mon] = buckets.get(mon, 0) + dev
@@ -458,7 +482,76 @@ async def cmd_allweeks(m: Message):
     text = f"{month_title}\n" + "\n".join(lines) + f"\nИтого: {sign_total}{total} мин"
     await m.answer(text)
 
-# --- Админские команды ---
+# --- Календарь: админ-команды ---
+DATE_RE = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$")
+
+@dp.message(Command("addholiday"))
+async def cmd_addholiday(m: Message):
+    if not is_admin(m.from_user.id, m.from_user.username):
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not DATE_RE.fullmatch(parts[1].strip()):
+        await m.answer("Формат: /addholiday ДД.ММ.ГГГГ"); return
+    dd, mm, yy = map(int, DATE_RE.fullmatch(parts[1].strip()).groups())
+    d = datetime(yy, mm, dd, tzinfo=TZ)
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO calendar(d,kind) VALUES($1,'holiday') "
+            "ON CONFLICT (d) DO UPDATE SET kind='holiday'",
+            d.date()
+        )
+    await m.answer(f"{d.strftime('%d.%m.%Y')} отмечен как выходной.")
+
+@dp.message(Command("addworkday"))
+async def cmd_addworkday(m: Message):
+    if not is_admin(m.from_user.id, m.from_user.username):
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not DATE_RE.fullmatch(parts[1].strip())):
+        await m.answer("Формат: /addworkday ДД.ММ.ГГГГ"); return
+    dd, mm, yy = map(int, DATE_RE.fullmatch(parts[1].strip()).groups())
+    d = datetime(yy, mm, dd, tzinfo=TZ)
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO calendar(d,kind) VALUES($1,'workday') "
+            "ON CONFLICT (d) DO UPDATE SET kind='workday'",
+            d.date()
+        )
+    await m.answer(f"{d.strftime('%d.%m.%Y')} отмечен как рабочий день.")
+
+@dp.message(Command("delday"))
+async def cmd_delday(m: Message):
+    if not is_admin(m.from_user.id, m.from_user.username):
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not DATE_RE.fullmatch(parts[1].strip())):
+        await m.answer("Формат: /delday ДД.ММ.ГГГГ"); return
+    dd, mm, yy = map(int, DATE_RE.fullmatch(parts[1].strip()).groups())
+    d = datetime(yy, mm, dd, tzinfo=TZ)
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("DELETE FROM calendar WHERE d=$1", d.date())
+    await m.answer(f"Исключение {d.strftime('%d.%m.%Y')} удалено.")
+
+@dp.message(Command("calendar"))
+async def cmd_calendar(m: Message):
+    if not is_admin(m.from_user.id, m.from_user.username):
+        return
+    now = local_now()
+    m0 = month_start(now).date()
+    m1 = next_month_start(now).date()
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT d, kind FROM calendar WHERE d >= $1 AND d < $2 ORDER BY d", m0, m1
+        )
+    if not rows:
+        await m.answer("В этом месяце нет исключений."); return
+    lines = []
+    for r in rows:
+        k = "выходной" if r["kind"] == "holiday" else "рабочий"
+        lines.append(f"{r['d'].strftime('%d.%m.%Y')} — {k}")
+    await m.answer("Исключения месяца:\n" + "\n".join(lines))
+
+# --- Админские утилиты ---
 @dp.message(Command("myid"))
 async def cmd_myid(m: Message):
     await m.answer(f"Твой Telegram ID: {m.from_user.id}\nUsername: @{m.from_user.username or '—'}")
