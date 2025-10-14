@@ -1,0 +1,18 @@
+services:
+  - type: worker
+    name: uchetka-bot
+    env: python
+    plan: free
+    buildCommand: ""
+    startCommand: "python app.py"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: uchetka-db
+          property: connectionString
+
+databases:
+  - name: uchetka-db
+    plan: free
