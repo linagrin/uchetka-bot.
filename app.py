@@ -461,16 +461,18 @@ async def cmd_in(m: Message):
     parts = (m.text or "").split(maxsplit=1)
     now = local_now()
     try:
-        when = parse_when(parts[1] if len(parts) > 1 else None, now)
+        when = parse_when(parts[1] if len(parts) > 1 else None, now)  # "10:30" или "14.10.2025 10:30", либо текущее время
     except ValueError as e:
         await m.answer(str(e)); return
     if not is_in_current_month(when, now):
         await m.answer("Отметки можно вносить только в рамках текущего месяца."); return
+
     async with DB_POOL.acquire() as conn:
         await ensure_user(conn, m.from_user.id)
         await purge_before_current_month(conn, now)
         txt = await upsert_in_for_day(conn, m.from_user.id, when)
         bal = await week_deviation(conn, m.from_user.id, when)
+
     sign = "+" if bal >= 0 else ""
     note = deficit_alert(when, bal)
     await m.answer(f"{txt}\nБаланс недели: {sign}{bal} мин." + (f"\n{note}" if note else ""))
@@ -480,15 +482,17 @@ async def cmd_out(m: Message):
     parts = (m.text or "").split(maxsplit=1)
     now = local_now()
     try:
-        when = parse_when(parts[1] if len(parts) > 1 else None, now)
+        when = parse_when(parts[1] if len(parts) > 1 else None, now)  # "10:30" или "14.10.2025 19:00", либо текущее время
     except ValueError as e:
         await m.answer(str(e)); return
     if not is_in_current_month(when, now):
         await m.answer("Отметки можно вносить только в рамках текущего месяца."); return
+
     async with DB_POOL.acquire() as conn:
         await purge_before_current_month(conn, now)
-        txt = await set_out_for_day(conn, m.from_user.id, when)
+        txt = await set_out_for_day(conn, m.from_user.id, when)  # сам вернёт внятное сообщение, если /in не было
         bal = await week_deviation(conn, m.from_user.id, when)
+
     sign = "+" if bal >= 0 else ""
     note = deficit_alert(when, bal)
     await m.answer(f"{txt}\nБаланс недели: {sign}{bal} мин." + (f"\n{note}" if note else ""))
