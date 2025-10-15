@@ -198,7 +198,7 @@ async def upsert_in_for_day(conn: asyncpg.Connection, uid: int, when: datetime) 
         await conn.execute("UPDATE sessions SET start_ts=$1 WHERE id=$2", when, row_any["id"])
         return f"Приход обновлён: {when.strftime('%d.%m.%Y %H:%M')}"
     await conn.execute("INSERT INTO sessions(user_id, start_ts) VALUES($1,$2)", uid, when)
-    return f"Старт {when.strftime('%d.%m.%Y %H:%М')}"
+    return f"Старт {when.strftime('%d.%m.%Y %H:%M')}"
 
 # Последний /out за день — главный
 async def set_out_for_day(conn: asyncpg.Connection, uid: int, when: datetime) -> str:
@@ -225,7 +225,7 @@ async def set_out_for_day(conn: asyncpg.Connection, uid: int, when: datetime) ->
         if when < start_ts:
             return "Время ухода раньше времени прихода. Укажи корректное время."
         await conn.execute("UPDATE sessions SET end_ts=$1 WHERE id=$2", when, row_any["id"])
-        return f"Финиш обновлён: {when.strftime('%d.%m.%Y %H:%M')} (начал(а) {start_ts.strftime('%d.%м.%Y %H:%M')})"
+        return f"Финиш обновлён: {when.strftime('%d.%m.%Y %H:%M')} (начал(а) {start_ts.strftime('%d.%m.%Y %H:%M')})"
     return "Нет сессии для этого дня. Сначала /in для этой даты."
 
 async def undo_last(conn: asyncpg.Connection, uid: int) -> str:
