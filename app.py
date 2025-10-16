@@ -1,32 +1,25 @@
-# УЧЕТКА — Telegram-бот учёта рабочего времени
-# Режим: 10:00–19:00 (Пн–Пт), перерывы не вычитаются.
-# Данные — только текущий месяц; 1-го числа — саммари прошлого.
-# Пятница до 19:00: предупреждение при жёстком недоборе.
-# Форматы ввода: "10:30", "14.10.2025 10:30", "14.10 10:30".
-# Функционал:
-# - /in, /out — фиксация, в т.ч. вручную, ТОЛЬКО в текущем месяце; повтор последним перезаписывает.
-# - /undo, /status, /day, /allweeks — отчёты и правки.
-# - Календарь исключений (глобально: праздники/переносы; лично: dayoff/sickleave).
-# - /broadcast — рассылка (только для админов).
-# НОВОЕ:
-# - /dayoff [ДД.ММ.ГГГГ] — личный выходной (не учитывается как ожидаемый рабочий)
-# - /sickleave [ДД.ММ.ГГГГ] — личный больничный (аналогично)
-# - Вечерний пинг (19:05–19:30): если нет отметок за ожидаемо рабочий день — предложение пометить «выходной» или «больничный».
+# UCHETKA — Telegram-бот учёта рабочего времени
+# Режим: 10:00–19:00 (Пн–Пт), обед не вычитается.
+# Данные — только текущий месяц. 1-го числа — саммари за прошлый.
+# Пятница — предупреждение о жёстком недоборе.
+# Личные исключения: /dayoff, /sickleave. Вечерний нудж, если нет отметок.
+# Админ: /calendar, /addholiday, /addworkday, /delday, /broadcast.
 
 import os
-import asyncio
 import re
+import asyncio
+import traceback
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import asyncpg
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiohttp import web
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
-# ---------- Константы ----------
-TZ = ZoneInfo("Europe/Amsterdam")
+# ------------------ Конфиг ------------------
+TZ = ZoneInfo(os.getenv("TZ", "Europe/Amsterdam"))
 START_T = time(10, 0)
 END_T   = time(19, 0)
 WORKDAYS = {0, 1, 2, 3, 4}
@@ -36,21 +29,66 @@ HARD_DEFICIT_MIN = 60
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# --- Админы: username и/или ID ---
+# Админы
 ADMIN_USERNAMES = {
     x.lstrip("@").lower()
     for x in os.getenv("ADMIN_USERNAMES", "linagrin").replace(" ", "").split(",")
     if x
 }
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+ADMIN_ALERT_ID = next(iter(ADMIN_IDS), None)  # для алертов о падении
 
-def is_admin(user_id: int, username: str | None) -> bool:
-    if user_id in ADMIN_IDS:
-        return True
-    if username and username.lower() in ADMIN_USERNAMES:
-        return True
-    return False
+# ------------------ Утилиты времени ------------------
+def local_now() -> datetime:
+    return datetime.now(TZ)
 
+def dlocal(dt: datetime) -> datetime:
+    return dt.astimezone(TZ)
+
+def week_monday(dt: datetime) -> datetime:
+    return (dt - timedelta(days=dt.weekday())).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ)
+
+def month_start(dt: datetime) -> datetime:
+    return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ)
+
+def next_month_start(dt: datetime) -> datetime:
+    first = month_start(dt)
+    tmp = first + timedelta(days=32)
+    return tmp.replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ)
+
+def prev_month_bounds(dt: datetime) -> tuple[datetime, datetime]:
+    this0 = month_start(dt)
+    prev_last = this0 - timedelta(days=1)
+    prev0 = month_start(prev_last)
+    return prev0, this0  # [prev0, this0)
+
+def is_in_current_month(when: datetime, now: datetime) -> bool:
+    return month_start(now) <= when < next_month_start(now)
+
+# Парсер времени: "10:30", "DD.MM.YYYY HH:MM", "DD.MM HH:MM", ISO fallback
+def parse_when(arg: str | None, now: datetime) -> datetime:
+    if not arg or not arg.strip():
+        return now
+    s = arg.strip()
+    m = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", s)
+    if m:
+        hh, mm = map(int, m.groups())
+        return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})\s+([01]\d|2[0-3]):([0-5]\d)", s)
+    if m:
+        dd, mo, yy, hh, mm = map(int, m.groups())
+        return datetime(yy, mo, dd, hh, mm, tzinfo=TZ)
+    m = re.fullmatch(r"(\d{2})\.(\d{2})\s+([01]\d|2[0-3]):([0-5]\d)", s)
+    if m:
+        dd, mo, hh, mm = map(int, m.groups())
+        return datetime(now.year, mo, dd, hh, mm, tzinfo=TZ)
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})\s+([01]\d|2[0-3]):([0-5]\d)", s)  # ISO fallback
+    if m:
+        y, mo, dd, hh, mm = map(int, m.groups())
+        return datetime(y, mo, dd, hh, mm, tzinfo=TZ)
+    raise ValueError("Форматы: «10:30», «14.10.2025 10:30» или «14.10 10:30».")
+
+# ------------------ БД ------------------
 DB_POOL: asyncpg.Pool | None = None
 
 SQL_SCHEMA = """
@@ -75,13 +113,13 @@ CREATE TABLE IF NOT EXISTS month_summaries(
   PRIMARY KEY(user_id, year, month)
 );
 
--- Глобальные исключения (общие для всех): holiday = выходной, workday = рабочий
+-- Глобальные исключения (общие для всех)
 CREATE TABLE IF NOT EXISTS calendar(
   d DATE PRIMARY KEY,
   kind TEXT NOT NULL CHECK (kind IN ('holiday','workday'))
 );
 
--- Личные исключения пользователя: dayoff = личный выходной, sickleave = больничный
+-- Личные исключения пользователя
 CREATE TABLE IF NOT EXISTS user_days(
   user_id BIGINT NOT NULL,
   d DATE NOT NULL,
@@ -89,7 +127,7 @@ CREATE TABLE IF NOT EXISTS user_days(
   PRIMARY KEY(user_id, d)
 );
 
--- Чтобы не спамить вечерним пингом: отметка, что нудж отправлен
+-- Чтобы не спамить вечерним пингом
 CREATE TABLE IF NOT EXISTS nudges_sent(
   user_id BIGINT NOT NULL,
   d DATE NOT NULL,
@@ -98,57 +136,11 @@ CREATE TABLE IF NOT EXISTS nudges_sent(
 );
 """
 
-# ---------- Время ----------
-def dlocal(dt: datetime) -> datetime:
-    return dt.astimezone(TZ)
+def is_admin(user_id: int, username: str | None) -> bool:
+    if user_id in ADMIN_IDS:
+        return True
+    return bool(username and username.lower() in ADMIN_USERNAMES)
 
-def local_now() -> datetime:
-    return datetime.now(TZ)
-
-def week_monday(dt: datetime) -> datetime:
-    return (dt - timedelta(days=dt.weekday())).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ)
-
-def month_start(dt: datetime) -> datetime:
-    return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ)
-
-def next_month_start(dt: datetime) -> datetime:
-    first = month_start(dt)
-    tmp = first + timedelta(days=32)
-    return tmp.replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ)
-
-def prev_month_bounds(dt: datetime) -> tuple[datetime, datetime]:
-    this0 = month_start(dt)
-    prev_last = this0 - timedelta(days=1)
-    prev0 = month_start(prev_last)
-    return prev0, this0  # [prev0, this0)
-
-def is_in_current_month(when: datetime, now: datetime) -> bool:
-    return month_start(now) <= when < next_month_start(now)
-
-# Парсер времени: "10:30"; "DD.MM.YYYY HH:MM"; "DD.MM HH:MM"; ISO fallback
-def parse_when(arg: str | None, now: datetime) -> datetime:
-    if not arg or not arg.strip():
-        return now
-    s = arg.strip()
-    m = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", s)
-    if m:
-        hh, mm = map(int, m.groups())
-        return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})\s+([01]\d|2[0-3]):([0-5]\d)", s)
-    if m:
-        dd, mo, yy, hh, mm = map(int, m.groups())
-        return datetime(yy, mo, dd, hh, mm, tzinfo=TZ)
-    m = re.fullmatch(r"(\d{2})\.(\d{2})\s+([01]\d|2[0-3]):([0-5]\d)", s)
-    if m:
-        dd, mo, hh, mm = map(int, m.groups())
-        return datetime(now.year, mo, dd, hh, mm, tzinfo=TZ)
-    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})\s+([01]\d|2[0-3]):([0-5]\d)", s)  # ISO fallback
-    if m:
-        y, mo, dd, hh, mm = map(int, m.groups())
-        return datetime(y, mo, dd, hh, mm, tzinfo=TZ)
-    raise ValueError("Форматы: «10:30», «14.10.2025 10:30» или «14.10 10:30».")
-
-# ---------- DB helpers ----------
 async def ensure_user(conn: asyncpg.Connection, uid: int):
     await conn.execute("INSERT INTO users(user_id) VALUES($1) ON CONFLICT DO NOTHING", uid)
 
@@ -156,19 +148,17 @@ async def purge_before_current_month(conn: asyncpg.Connection, now: datetime):
     m0 = month_start(now)
     await conn.execute("DELETE FROM sessions WHERE start_ts < $1", m0)
 
-# Глобальный календарь: Пн–Пт + исключения (holiday/workday)
+# Глобальный календарь и личные исключения
 async def is_workday_global(conn: asyncpg.Connection, d: datetime) -> bool:
     row = await conn.fetchrow("SELECT kind FROM calendar WHERE d=$1", d.date())
     if row:
         return row["kind"] == "workday"
     return d.weekday() in WORKDAYS
 
-# Личные исключения
 async def user_day_kind(conn: asyncpg.Connection, uid: int, d: datetime) -> str | None:
     row = await conn.fetchrow("SELECT kind FROM user_days WHERE user_id=$1 AND d=$2", uid, d.date())
     return row["kind"] if row else None
 
-# Ожидается ли работа у этого пользователя в этот день?
 async def is_user_expected_workday(conn: asyncpg.Connection, uid: int, d: datetime) -> bool:
     if not await is_workday_global(conn, d):
         return False
@@ -177,10 +167,11 @@ async def is_user_expected_workday(conn: asyncpg.Connection, uid: int, d: dateti
         return False
     return True
 
-# Последний /in за день — главный
+# ------------------ Сессии ------------------
 async def upsert_in_for_day(conn: asyncpg.Connection, uid: int, when: datetime) -> str:
     day0 = datetime(when.year, when.month, when.day, 0, 0, tzinfo=TZ)
     day1 = day0 + timedelta(days=1)
+
     row_open = await conn.fetchrow("""
         SELECT id FROM sessions
         WHERE user_id=$1 AND end_ts IS NULL AND start_ts >= $2 AND start_ts < $3
@@ -189,6 +180,7 @@ async def upsert_in_for_day(conn: asyncpg.Connection, uid: int, when: datetime) 
     if row_open:
         await conn.execute("UPDATE sessions SET start_ts=$1 WHERE id=$2", when, row_open["id"])
         return f"Приход обновлён: {when.strftime('%d.%m.%Y %H:%M')}"
+
     row_any = await conn.fetchrow("""
         SELECT id FROM sessions
         WHERE user_id=$1 AND start_ts >= $2 AND start_ts < $3
@@ -197,13 +189,14 @@ async def upsert_in_for_day(conn: asyncpg.Connection, uid: int, when: datetime) 
     if row_any:
         await conn.execute("UPDATE sessions SET start_ts=$1 WHERE id=$2", when, row_any["id"])
         return f"Приход обновлён: {when.strftime('%d.%m.%Y %H:%M')}"
+
     await conn.execute("INSERT INTO sessions(user_id, start_ts) VALUES($1,$2)", uid, when)
     return f"Старт {when.strftime('%d.%m.%Y %H:%M')}"
 
-# Последний /out за день — главный
 async def set_out_for_day(conn: asyncpg.Connection, uid: int, when: datetime) -> str:
     day0 = datetime(when.year, when.month, when.day, 0, 0, tzinfo=TZ)
     day1 = day0 + timedelta(days=1)
+
     row_open = await conn.fetchrow("""
         SELECT id, start_ts FROM sessions
         WHERE user_id=$1 AND end_ts IS NULL AND start_ts >= $2 AND start_ts < $3
@@ -215,6 +208,7 @@ async def set_out_for_day(conn: asyncpg.Connection, uid: int, when: datetime) ->
             return "Время ухода раньше времени прихода. Укажи корректное время."
         await conn.execute("UPDATE sessions SET end_ts=$1 WHERE id=$2", when, row_open["id"])
         return f"Финиш {when.strftime('%d.%m.%Y %H:%M')} (начал(а) {start_ts.strftime('%d.%m.%Y %H:%M')})"
+
     row_any = await conn.fetchrow("""
         SELECT id, start_ts, end_ts FROM sessions
         WHERE user_id=$1 AND start_ts >= $2 AND start_ts < $3
@@ -226,6 +220,7 @@ async def set_out_for_day(conn: asyncpg.Connection, uid: int, when: datetime) ->
             return "Время ухода раньше времени прихода. Укажи корректное время."
         await conn.execute("UPDATE sessions SET end_ts=$1 WHERE id=$2", when, row_any["id"])
         return f"Финиш обновлён: {when.strftime('%d.%m.%Y %H:%M')} (начал(а) {start_ts.strftime('%d.%m.%Y %H:%M')})"
+
     return "Нет сессии для этого дня. Сначала /in для этой даты."
 
 async def undo_last(conn: asyncpg.Connection, uid: int) -> str:
@@ -237,7 +232,7 @@ async def undo_last(conn: asyncpg.Connection, uid: int) -> str:
     e = dlocal(row["end_ts"]).strftime("%d.%m.%Y %H:%M") if row["end_ts"] else "…"
     return f"Последняя сессия удалена: {s}–{e}"
 
-# ---------- Расчёты ----------
+# ------------------ Расчёты ------------------
 def _deviation_minutes(first_in: datetime|None, last_out: datetime|None, day: datetime) -> int:
     t0 = datetime.combine(day.date(), START_T, TZ)
     t1 = datetime.combine(day.date(), END_T, TZ)
@@ -346,7 +341,7 @@ async def month_summary_text(conn: asyncpg.Connection, uid: int, first_prev: dat
             f"Постарайся не допускать такого в следующем месяце"
         )
 
-# ---------- Планировщики ----------
+# ------------------ Планировщики ------------------
 async def send_month_summaries(bot: Bot, pool: asyncpg.Pool):
     while True:
         try:
@@ -375,7 +370,6 @@ async def send_month_summaries(bot: Bot, pool: asyncpg.Pool):
         await asyncio.sleep(600)
 
 async def send_daily_nudges(bot: Bot, pool: asyncpg.Pool):
-    # Каждый день ~19:05–19:30: тем, у кого нет отметок за ожидаемый рабочий день, прислать предложение пометить день.
     while True:
         try:
             now = local_now()
@@ -383,14 +377,11 @@ async def send_daily_nudges(bot: Bot, pool: asyncpg.Pool):
                 async with pool.acquire() as conn:
                     uids = [r["user_id"] for r in await conn.fetch("SELECT user_id FROM users")]
                     for uid in uids:
-                        # Пропускаем, если день не ожидался как рабочий (праздник/перенос или личный dayoff/sickleave)
                         if not await is_user_expected_workday(conn, uid, now):
                             continue
-                        # Нет ли уже nudges_sent?
                         n = await conn.fetchrow("SELECT 1 FROM nudges_sent WHERE user_id=$1 AND d=$2", uid, now.date())
                         if n:
                             continue
-                        # Были ли какие-то отметки сегодня?
                         day0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
                         day1 = day0 + timedelta(days=1)
                         any_row = await conn.fetchrow("""
@@ -399,8 +390,7 @@ async def send_daily_nudges(bot: Bot, pool: asyncpg.Pool):
                             LIMIT 1
                         """, uid, day1, day0)
                         if any_row:
-                            continue  # отметки есть — не трогаем
-                        # Отправляем пинг с кнопками
+                            continue
                         kb = InlineKeyboardMarkup(inline_keyboard=[[
                             InlineKeyboardButton(text="Пометить как выходной", callback_data=f"mark:dayoff:{now.date()}"),
                             InlineKeyboardButton(text="Больничный", callback_data=f"mark:sickleave:{now.date()}")
@@ -414,7 +404,7 @@ async def send_daily_nudges(bot: Bot, pool: asyncpg.Pool):
             print("daily nudge error:", e)
         await asyncio.sleep(300)
 
-# ---------- Health ----------
+# ------------------ Health ------------------
 async def run_health_server():
     async def handle(_):
         return web.Response(text="ok")
@@ -426,11 +416,11 @@ async def run_health_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# ---------- Бот ----------
+# ------------------ Бот ------------------
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Короткий /start
+# /start
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     now = local_now()
@@ -444,54 +434,53 @@ async def cmd_help(m: Message):
     await m.answer(
         "Подсказки:\n"
         "• /in — приход (можно: «/in 10:30» или «/in 14.10.2025 10:30»)\n"
-        "• /out — уход (можно с временем, как выше)\n"
+        "• /out — уход (аналогично)\n"
         "• /undo — отмена последней отметки\n"
         "• /status — баланс текущей недели\n"
         "• /day — отчёт за сегодня (можно дату: «/day 14.10.2025»)\n"
-        "• /allweeks — балансы по всем неделям текущего месяца + итог\n"
-        "• /dayoff [ДД.ММ.ГГГГ] — личный выходной (если без даты — сегодня)\n"
-        "• /sickleave [ДД.ММ.ГГГГ] — больничный (если без даты — сегодня)\n"
-        "\nПравила: 10:00–19:00, без вычета обеда. Данные — только текущий месяц.\n"
-        "Повторная отметка за день заменяет предыдущую. Праздники/переносы и личные выходные учитываются."
+        "• /allweeks — балансы по неделям текущего месяца + итог\n"
+        "• /dayoff [ДД.ММ.ГГГГ] — личный выходной\n"
+        "• /sickleave [ДД.ММ.ГГГГ] — больничный\n"
+        "Работаем в текущем месяце. Последняя отметка за день перезаписывает предыдущую."
     )
 
-# --- Команды фиксации ---
+# --- Безопасные /in и /out ---
 @dp.message(Command("in"))
 async def cmd_in(m: Message):
     parts = (m.text or "").split(maxsplit=1)
     now = local_now()
     try:
-        when = parse_when(parts[1] if len(parts) > 1 else None, now)  # 10:30 / 14.10.2025 10:30 / текущее
-    except ValueError as e:
-        await m.answer(str(e)); return
-    if not is_in_current_month(when, now):
-        await m.answer("Отметки можно вносить только в рамках текущего месяца."); return
-    async with DB_POOL.acquire() as conn:
-        await ensure_user(conn, m.from_user.id)
-        await purge_before_current_month(conn, now)
-        txt = await upsert_in_for_day(conn, m.from_user.id, when)
-        bal = await week_deviation(conn, m.from_user.id, when)
-    sign = "+" if bal >= 0 else ""
-    note = deficit_alert(when, bal)
-    await m.answer(f"{txt}\nБаланс недели: {sign}{bal} мин." + (f"\n{note}" if note else ""))
+        when = parse_when(parts[1] if len(parts) > 1 else None, now)
+        if not is_in_current_month(when, now):
+            await m.answer("Отметки можно вносить только в рамках текущего месяца."); return
+        async with DB_POOL.acquire() as conn:
+            await ensure_user(conn, m.from_user.id)
+            await purge_before_current_month(conn, now)
+            txt = await upsert_in_for_day(conn, m.from_user.id, when)
+            bal = await week_deviation(conn, m.from_user.id, when)
+        sign = "+" if bal >= 0 else ""
+        note = deficit_alert(when, bal)
+        await m.answer(f"{txt}\nБаланс недели: {sign}{bal} мин." + (f"\n{note}" if note else ""))
+    except Exception as e:
+        await m.answer(f"Не удалось записать приход: {e}")
 
 @dp.message(Command("out"))
 async def cmd_out(m: Message):
     parts = (m.text or "").split(maxsplit=1)
     now = local_now()
     try:
-        when = parse_when(parts[1] if len(parts) > 1 else None, now)  # 19:00 / 14.10.2025 19:00 / текущее
-    except ValueError as e:
-        await m.answer(str(e)); return
-    if not is_in_current_month(when, now):
-        await m.answer("Отметки можно вносить только в рамках текущего месяца."); return
-    async with DB_POOL.acquire() as conn:
-        await purge_before_current_month(conn, now)
-        txt = await set_out_for_day(conn, m.from_user.id, when)  # вернёт подсказку, если /in не было
-        bal = await week_deviation(conn, m.from_user.id, when)
-    sign = "+" if bal >= 0 else ""
-    note = deficit_alert(when, bal)
-    await m.answer(f"{txt}\nБаланс недели: {sign}{bal} мин." + (f"\n{note}" if note else ""))
+        when = parse_when(parts[1] if len(parts) > 1 else None, now)
+        if not is_in_current_month(when, now):
+            await m.answer("Отметки можно вносить только в рамках текущего месяца."); return
+        async with DB_POOL.acquire() as conn:
+            await purge_before_current_month(conn, now)
+            txt = await set_out_for_day(conn, m.from_user.id, when)
+            bal = await week_deviation(conn, m.from_user.id, when)
+        sign = "+" if bal >= 0 else ""
+        note = deficit_alert(when, bal)
+        await m.answer(f"{txt}\nБаланс недели: {sign}{bal} мин." + (f"\n{note}" if note else ""))
+    except Exception as e:
+        await m.answer(f"Не удалось записать уход: {e}")
 
 @dp.message(Command("undo"))
 async def cmd_undo(m: Message):
@@ -502,12 +491,11 @@ async def cmd_undo(m: Message):
     sign = "+" if bal >= 0 else ""
     await m.answer(f"{msg}\nТекущий баланс недели: {sign}{bal} мин.")
 
-# --- Личные исключения: /dayoff, /sickleave ---
+# Личные исключения
 DATE_RE = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$")
 
 async def set_user_day_kind(uid: int, d: datetime, kind: str) -> None:
     async with DB_POOL.acquire() as conn:
-        # не даём пометить, если уже есть отметки за день
         day0 = d.replace(hour=0, minute=0, second=0, microsecond=0)
         day1 = day0 + timedelta(days=1)
         exists = await conn.fetchrow("""
@@ -561,7 +549,7 @@ async def cmd_sickleave(m: Message):
         await m.answer(str(e)); return
     await m.answer(f"{d.strftime('%d.%m.%Y')} помечен как больничный.")
 
-# --- Отчёты ---
+# Отчёты
 @dp.message(Command("status"))
 async def cmd_status(m: Message):
     now = local_now()
@@ -632,7 +620,26 @@ async def cmd_allweeks(m: Message):
     text = f"{month_title}\n" + "\n".join(lines) + f"\nИтого: {sign_total}{total} мин"
     await m.answer(text)
 
-# --- Глобальный календарь: админ-команды ---
+# Админ-календарь
+@dp.message(Command("calendar"))
+async def cmd_calendar(m: Message):
+    if not is_admin(m.from_user.id, m.from_user.username):
+        return
+    now = local_now()
+    m0 = month_start(now).date()
+    m1 = next_month_start(now).date()
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT d, kind FROM calendar WHERE d >= $1 AND d < $2 ORDER BY d", m0, m1
+        )
+    if not rows:
+        await m.answer("В этом месяце нет исключений."); return
+    lines = []
+    for r in rows:
+        k = "выходной" if r["kind"] == "holiday" else "рабочий"
+        lines.append(f"{r['d'].strftime('%d.%m.%Y')} — {k}")
+    await m.answer("Исключения месяца:\n" + "\n".join(lines))
+
 @dp.message(Command("addholiday"))
 async def cmd_addholiday(m: Message):
     if not is_admin(m.from_user.id, m.from_user.username):
@@ -680,26 +687,7 @@ async def cmd_delday(m: Message):
         await conn.execute("DELETE FROM calendar WHERE d=$1", d.date())
     await m.answer(f"Исключение {d.strftime('%d.%m.%Y')} удалено (глобально).")
 
-@dp.message(Command("calendar"))
-async def cmd_calendar(m: Message):
-    if not is_admin(m.from_user.id, m.from_user.username):
-        return
-    now = local_now()
-    m0 = month_start(now).date()
-    m1 = next_month_start(now).date()
-    async with DB_POOL.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT d, kind FROM calendar WHERE d >= $1 AND d < $2 ORDER BY d", m0, m1
-        )
-    if not rows:
-        await m.answer("В этом месяце нет исключений."); return
-    lines = []
-    for r in rows:
-        k = "выходной" if r["kind"] == "holiday" else "рабочий"
-        lines.append(f"{r['d'].strftime('%d.%m.%Y')} — {k}")
-    await m.answer("Исключения месяца:\n" + "\n".join(lines))
-
-# --- Админские утилиты ---
+# Админ-утилиты
 @dp.message(Command("myid"))
 async def cmd_myid(m: Message):
     await m.answer(f"Твой Telegram ID: {m.from_user.id}\nUsername: @{m.from_user.username or '—'}")
@@ -726,13 +714,13 @@ async def cmd_broadcast(m: Message):
         await asyncio.sleep(0.05)
     await m.answer(f"Рассылка завершена. Успешно: {sent}, ошибок: {failed}.")
 
-# --- Callback: обработка кнопок пинга ---
+# Callback от вечернего нуджа
 @dp.callback_query(F.data.startswith("mark:"))
-async def cb_mark_dayoff_sick(cq: CallbackQuery):
+async def cb_mark(cq: CallbackQuery):
     try:
         _, kind, datestr = cq.data.split(":")
-        y, m, d = map(int, datestr.split("-"))
-        day = datetime(y, m, d, tzinfo=TZ)
+        y, mth, d = map(int, datestr.split("-"))
+        day = datetime(y, mth, d, tzinfo=TZ)
         now = local_now()
         if not is_in_current_month(day, now):
             await cq.message.answer("Можно помечать только дни текущего месяца."); await cq.answer(); return
@@ -742,20 +730,46 @@ async def cb_mark_dayoff_sick(cq: CallbackQuery):
         label = "личный выходной" if kind == "dayoff" else "больничный"
         await cq.message.edit_text(f"{day.strftime('%d.%m.%Y')} помечен как {label}.")
         await cq.answer()
-    except Exception as e:
+    except Exception:
         await cq.answer()
 
-# ---------- Точка входа ----------
+# ------------------ Надёжный запуск polling ------------------
+async def start_polling_forever():
+    # снимаем вебхук, чтобы updates шли только через polling
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        pass
+
+    while True:
+        try:
+            await dp.start_polling(
+                bot,
+                allowed_updates=dp.resolve_used_update_types(),
+                handle_signals=False
+            )
+        except Exception as e:
+            tb = traceback.format_exc(limit=6)
+            print("POLLING CRASHED:", tb)
+            if ADMIN_ALERT_ID:
+                try:
+                    await bot.send_message(ADMIN_ALERT_ID, f"❗️Бот перезапускается:\n{e}\n\n{tb}")
+                except Exception:
+                    pass
+            await asyncio.sleep(3)
+
 async def main():
     global DB_POOL
     DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     async with DB_POOL.acquire() as conn:
         await conn.execute(SQL_SCHEMA)
+
     asyncio.create_task(run_health_server())
     asyncio.create_task(send_month_summaries(bot, DB_POOL))
     asyncio.create_task(send_daily_nudges(bot, DB_POOL))
+
     print("Uchetka bot started")
-    await dp.start_polling(bot)
+    await start_polling_forever()
 
 if __name__ == "__main__":
     asyncio.run(main())
