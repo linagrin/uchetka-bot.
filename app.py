@@ -771,5 +771,66 @@ async def main():
     print("Uchetka bot started")
     await start_polling_forever()
 
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+
+async def build_aiohttp_app():
+    app = web.Application()
+
+    async def health(_):
+        return web.Response(text="ok")
+    app.router.add_get("/healthz", health)
+
+    # Регистрируем обработчик вебхука
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
+    ).register(app, WEBHOOK_PATH)
+
+    setup_application(app, dp, bot=bot)
+    return app
+
+async def main():
+    # БД и таблицы
+    global DB_POOL
+    DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(SQL_SCHEMA)
+
+    # Планировщики
+    asyncio.create_task(send_month_summaries(bot, DB_POOL))
+    asyncio.create_task(send_daily_nudges(bot, DB_POOL))
+
+    # Снимаем старый вебхук и ставим новый
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        pass
+    if not PUBLIC_URL:
+        raise RuntimeError("PUBLIC_URL не задан в Environment.")
+
+    await bot.set_webhook(
+        url=f"{PUBLIC_URL}{WEBHOOK_PATH}",
+        secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
+        drop_pending_updates=False,
+    )
+
+    # Поднимаем веб-сервер
+    app = await build_aiohttp_app()
+    port = int(os.getenv("PORT", "8000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Webhook set → {PUBLIC_URL}{WEBHOOK_PATH} | listening on :{port}")
+
+    # Не завершаемся
+    while True:
+        await asyncio.sleep(3600)
+
 if __name__ == "__main__":
     asyncio.run(main())
